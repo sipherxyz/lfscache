@@ -42,7 +42,18 @@ type BatchObjectResponse struct {
 	OID           string                                `json:"oid"`
 	Size          int64                                 `json:"size"`
 	Authenticated bool                                  `json:"authenticated,omitempty"`
-	Actions       map[string]*BatchObjectActionResponse `json:"actions"`
+	Actions       map[string]*BatchObjectActionResponse `json:"actions,omitempty"`
+	Error         *BatchObjectError                     `json:"error,omitempty"`
+}
+
+// BatchObjectError is the per-object error of a BatchObjectResponse, for
+// example a 404 when the upstream does not have the object. It is passed
+// through unchanged so that clients fail instead of silently skipping.
+//
+// https://github.com/git-lfs/git-lfs/blob/master/docs/api/batch.md#response-errors
+type BatchObjectError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 }
 
 // BatchObjectActionResponse is the action item of a BatchObjectResponse
@@ -50,7 +61,27 @@ type BatchObjectActionResponse struct {
 	Href      string            `json:"href"`
 	Header    map[string]string `json:"header,omitempty"`
 	ExpiresIn int               `json:"expires_in,omitempty"`
-	ExpiresAt time.Time         `json:"expires_at,omitempty"`
+	ExpiresAt *time.Time        `json:"expires_at,omitempty"`
+}
+
+// batchRequest is a batch request payload.
+//
+// https://github.com/git-lfs/git-lfs/blob/master/docs/api/batch.md#requests
+type batchRequest struct {
+	Operation string               `json:"operation"`
+	Transfers []string             `json:"transfers,omitempty"`
+	Ref       *batchRequestRef     `json:"ref,omitempty"`
+	Objects   []batchRequestObject `json:"objects"`
+	HashAlgo  string               `json:"hash_algo,omitempty"`
+}
+
+type batchRequestRef struct {
+	Name string `json:"name"`
+}
+
+type batchRequestObject struct {
+	OID  string `json:"oid"`
+	Size int64  `json:"size"`
 }
 
 const (
@@ -94,6 +125,10 @@ type Server struct {
 	client   *http.Client
 	hmacKey  [64]byte
 
+	readOnly      bool
+	upstreamUser  string
+	upstreamToken func() (string, error)
+
 	ObjectBatchActionURLRewriter func(href *url.URL) *url.URL
 }
 
@@ -105,6 +140,32 @@ func New(logger log.Logger, upstream, directory string) (*Server, error) {
 // NewNoCache returns a new LFS proxy server, with no caching.
 func NewNoCache(logger log.Logger, upstream string) (*Server, error) {
 	return newServer(logger, upstream, "", false)
+}
+
+// NewReadOnly returns a new LFS caching server that only serves download
+// batch requests. Clients are not required to authenticate: every upstream
+// batch request is sent with HTTP Basic auth using username and the token
+// returned by token, and the download href carries the upstream details in a
+// sealed token instead of headers the client has to echo back.
+func NewReadOnly(logger log.Logger, upstream, directory, username string, token func() (string, error)) (*Server, error) {
+	if token == nil {
+		return nil, errors.New("read-only mode requires an upstream token provider")
+	}
+
+	s, err := newServer(logger, upstream, directory, true)
+	if err != nil {
+		return nil, err
+	}
+	s.readOnly = true
+	s.upstreamUser = username
+	s.upstreamToken = token
+
+	s.mux = http.NewServeMux()
+	s.mux.HandleFunc(ContentCachePathPrefix, s.serve)
+	s.mux.Handle("/objects/batch", s.readOnlyBatch(s.batch()))
+	s.mux.HandleFunc("/", s.denyReadOnly)
+
+	return s, nil
 }
 
 func newServer(logger log.Logger, upstream, directory string, cacheEnabled bool) (*Server, error) {
@@ -174,7 +235,7 @@ func (s *Server) Handle() http.Handler {
 func (s *Server) proxy() *httputil.ReverseProxy {
 	director := func(req *http.Request) {
 		outreq := req.WithContext(context.WithValue(req.Context(), contextKeyOriginalHost, &originalHost{
-			http: req.TLS == nil,
+			http: req.TLS == nil && requestUsesHTTP(req),
 			host: req.Host,
 		}))
 		*req = *outreq
@@ -222,29 +283,58 @@ func (s *Server) batch() *httputil.ReverseProxy {
 			return s.batchResponse(&br, compress, r)
 		}
 
-		// modify batch request urls
+		host, ok := r.Request.Context().Value(contextKeyOriginalHost).(*originalHost)
+		if !ok {
+			panic("lfscache error: original host information not set")
+		}
+
+		scheme := "http"
+		if !host.http {
+			scheme = "https"
+		}
+
+		// modify batch request urls; objects without actions (for example
+		// an upstream per-object error) are passed through untouched
 		for _, object := range br.Objects {
 			for operation, action := range object.Actions {
+				if operation != "download" && s.readOnly {
+					delete(object.Actions, operation)
+					continue
+				}
 				if operation != "download" && s.cache != nil {
 					continue
 				}
-				if action.Header == nil {
-					action.Header = make(map[string]string)
+
+				if s.readOnly {
+					expiresAt := time.Now().UTC().Add(downloadTokenTTL).Truncate(time.Second)
+					token, err := s.sealAction(object.OID, object.Size, action.Href, action.Header, expiresAt)
+					if err != nil {
+						return err
+					}
+
+					href := s.ObjectBatchActionURLRewriter(&url.URL{
+						Scheme: scheme,
+						Host:   host.host,
+						Path:   ContentCachePathPrefix + object.OID,
+					})
+					query := href.Query()
+					query.Set("token", token)
+					href.RawQuery = query.Encode()
+
+					action.Href = href.String()
+					action.Header = nil
+					action.ExpiresIn = int(downloadTokenTTL / time.Second)
+					action.ExpiresAt = &expiresAt
+					continue
 				}
 
-				host, ok := r.Request.Context().Value(contextKeyOriginalHost).(*originalHost)
-				if !ok {
-					panic("lfscache error: original host information not set")
+				if action.Header == nil {
+					action.Header = make(map[string]string)
 				}
 
 				list := make([]string, 0, len(action.Header))
 				for header := range action.Header {
 					list = append(list, header)
-				}
-
-				scheme := "http"
-				if !host.http {
-					scheme = "https"
 				}
 
 				action.Header[UpstreamHeaderList] = strings.Join(list, ";")
@@ -269,6 +359,70 @@ func (s *Server) batch() *httputil.ReverseProxy {
 	}
 
 	return proxy
+}
+
+// readOnlyBatch only lets download batch requests through to the upstream,
+// replacing whatever credentials the client sent with the server's own.
+func (s *Server) readOnlyBatch(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			s.denyReadOnly(w, r)
+			return
+		}
+
+		// decode strictly and send the upstream our own serialization, so
+		// that the upstream cannot read a different operation out of the
+		// client's bytes than we did (duplicate or oddly-cased keys)
+		var req batchRequest
+		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			http.Error(w, "invalid LFS batch request", http.StatusBadRequest)
+			return
+		}
+		if req.Operation != "download" {
+			s.denyReadOnly(w, r)
+			return
+		}
+
+		body, err := json.Marshal(req)
+		if err != nil {
+			http.Error(w, "invalid LFS batch request", http.StatusBadRequest)
+			return
+		}
+		r.Body = ioutil.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		r.Header.Del("Content-Encoding")
+
+		token, err := s.upstreamToken()
+		if err != nil {
+			level.Error(s.logger).Log("event", "upstream-token", "err", err)
+			http.Error(w, "upstream credential unavailable", http.StatusInternalServerError)
+			return
+		}
+
+		r.Header.Del("Authorization")
+		r.SetBasicAuth(s.upstreamUser, token)
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) denyReadOnly(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+	w.WriteHeader(http.StatusForbidden)
+	json.NewEncoder(w).Encode(map[string]string{"message": "this LFS cache permits downloads only"})
+}
+
+// requestUsesHTTP reports whether the client reached us over plain HTTP,
+// taking a proxy's X-Forwarded-Proto into account.
+func requestUsesHTTP(r *http.Request) bool {
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if proto == "" {
+		return true
+	}
+	return !strings.EqualFold(strings.TrimSpace(strings.Split(proto, ",")[0]), "https")
 }
 
 func (s *Server) batchResponse(br *BatchResponse, compress bool, r *http.Response) error {
@@ -359,6 +513,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) parseHeaders(r *http.Request) (url string, size int, header http.Header, err error) {
+	if token := r.URL.Query().Get("token"); token != "" {
+		return s.openAction(path.Base(r.URL.Path), token)
+	}
+	if s.readOnly {
+		return "", 0, nil, errors.New("missing token")
+	}
+
 	// check header is valid
 	signature, err := hex.DecodeString(r.Header.Get(SignatureHeader))
 	if err != nil {
