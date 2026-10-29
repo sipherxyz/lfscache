@@ -64,9 +64,24 @@ type BatchObjectActionResponse struct {
 	ExpiresAt *time.Time        `json:"expires_at,omitempty"`
 }
 
-// batchRequest is the subset of a batch request payload the server inspects.
+// batchRequest is a batch request payload.
+//
+// https://github.com/git-lfs/git-lfs/blob/master/docs/api/batch.md#requests
 type batchRequest struct {
-	Operation string `json:"operation"`
+	Operation string               `json:"operation"`
+	Transfers []string             `json:"transfers,omitempty"`
+	Ref       *batchRequestRef     `json:"ref,omitempty"`
+	Objects   []batchRequestObject `json:"objects"`
+	HashAlgo  string               `json:"hash_algo,omitempty"`
+}
+
+type batchRequestRef struct {
+	Name string `json:"name"`
+}
+
+type batchRequestObject struct {
+	OID  string `json:"oid"`
+	Size int64  `json:"size"`
 }
 
 const (
@@ -282,6 +297,10 @@ func (s *Server) batch() *httputil.ReverseProxy {
 		// an upstream per-object error) are passed through untouched
 		for _, object := range br.Objects {
 			for operation, action := range object.Actions {
+				if operation != "download" && s.readOnly {
+					delete(object.Actions, operation)
+					continue
+				}
 				if operation != "download" && s.cache != nil {
 					continue
 				}
@@ -351,15 +370,13 @@ func (s *Server) readOnlyBatch(next http.Handler) http.Handler {
 			return
 		}
 
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "invalid LFS batch request", http.StatusBadRequest)
-			return
-		}
-		r.Body = ioutil.NopCloser(bytes.NewReader(body))
-
+		// decode strictly and send the upstream our own serialization, so
+		// that the upstream cannot read a different operation out of the
+		// client's bytes than we did (duplicate or oddly-cased keys)
 		var req batchRequest
-		if err = json.Unmarshal(body, &req); err != nil {
+		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
 			http.Error(w, "invalid LFS batch request", http.StatusBadRequest)
 			return
 		}
@@ -367,6 +384,16 @@ func (s *Server) readOnlyBatch(next http.Handler) http.Handler {
 			s.denyReadOnly(w, r)
 			return
 		}
+
+		body, err := json.Marshal(req)
+		if err != nil {
+			http.Error(w, "invalid LFS batch request", http.StatusBadRequest)
+			return
+		}
+		r.Body = ioutil.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		r.Header.Del("Content-Encoding")
 
 		token, err := s.upstreamToken()
 		if err != nil {

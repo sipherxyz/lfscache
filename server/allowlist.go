@@ -40,11 +40,22 @@ func remoteIP(remoteAddr string) net.IP {
 	return net.ParseIP(host)
 }
 
-// rightmostForwardedIP returns the last address of an X-Forwarded-For header,
-// which is the one appended by the proxy that sent us the request.
-func rightmostForwardedIP(forwardedFor string) net.IP {
-	parts := strings.Split(forwardedFor, ",")
-	return net.ParseIP(strings.TrimSpace(parts[len(parts)-1]))
+// rightmostForwardedIP walks every X-Forwarded-For entry from the right,
+// skipping trusted proxies, and returns the first address that was not
+// appended by a proxy we trust. Entries further left are client-supplied and
+// cannot be trusted.
+func rightmostForwardedIP(forwardedFor []string, trustedProxies []*net.IPNet) net.IP {
+	entries := strings.Split(strings.Join(forwardedFor, ","), ",")
+	for i := len(entries) - 1; i >= 0; i-- {
+		ip := net.ParseIP(strings.TrimSpace(entries[i]))
+		if ip == nil {
+			return nil
+		}
+		if !contains(trustedProxies, ip) {
+			return ip
+		}
+	}
+	return nil
 }
 
 // NewCIDRAllowlist wraps next so that only clients inside allowed may use it.
@@ -66,9 +77,7 @@ func NewCIDRAllowlist(next http.Handler, allowed, trustedProxies []string) (http
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := remoteIP(r.RemoteAddr)
 		if ip != nil && contains(proxyNets, ip) {
-			if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-				ip = rightmostForwardedIP(forwarded)
-			}
+			ip = rightmostForwardedIP(r.Header.Values("X-Forwarded-For"), proxyNets)
 		}
 		if ip == nil || !contains(allowedNets, ip) {
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)

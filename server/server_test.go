@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/kit/log"
@@ -107,6 +108,8 @@ func upstreamWithMissing(t *testing.T) *httptest.Server {
 		case "/objects/batch":
 			user, pass, _ := r.BasicAuth()
 			w.Header().Set("X-Upstream-Auth", user+":"+pass)
+			body, _ := ioutil.ReadAll(r.Body)
+			w.Header().Set("X-Upstream-Body", string(body))
 			json.NewEncoder(w).Encode(BatchResponse{
 				Transfer: "basic",
 				Objects: []*BatchObjectResponse{
@@ -181,9 +184,11 @@ func TestReadOnly(t *testing.T) {
 	s, err := NewReadOnly(log.NewNopLogger(), ts.URL, dir, "x-access-token", func() (string, error) { return "pat", nil })
 	require.NoError(t, err)
 
-	// uploads and anything but the batch endpoint are refused
+	// uploads and anything but the batch endpoint are refused, including a
+	// body whose duplicate "operation" key the upstream could read as upload
 	for _, req := range []*http.Request{
 		httptest.NewRequest("POST", ts.URL+"/objects/batch", batchJSON("upload")),
+		httptest.NewRequest("POST", ts.URL+"/objects/batch", bytes.NewReader([]byte(`{"operation":"download","operation":"upload","objects":[]}`))),
 		httptest.NewRequest("GET", ts.URL+"/", nil),
 		httptest.NewRequest("GET", ts.URL+"/objects/batch", nil),
 	} {
@@ -200,6 +205,7 @@ func TestReadOnly(t *testing.T) {
 	s.Handle().ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "x-access-token:pat", w.Header().Get("X-Upstream-Auth"))
+	assert.JSONEq(t, `{"operation":"download","transfers":["basic"],"objects":[{"oid":"1111111","size":8},{"oid":"2222222","size":100}]}`, w.Header().Get("X-Upstream-Body"))
 
 	var br BatchResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &br))
@@ -245,13 +251,18 @@ func TestCIDRAllowlist(t *testing.T) {
 		{"10.0.0.1:1234", "", http.StatusForbidden},
 		{"172.19.0.1:1234", "172.30.22.9", http.StatusNoContent},
 		{"172.19.0.1:1234", "172.30.22.9, 8.8.8.8", http.StatusForbidden},
+		{"172.19.0.1:1234", "8.8.8.8, 172.30.22.9, 172.19.0.1", http.StatusNoContent},
+		{"172.19.0.1:1234", "172.30.22.9|8.8.8.8", http.StatusForbidden},
+		{"172.19.0.1:1234", "", http.StatusForbidden},
 		{"10.0.0.1:1234", "172.30.22.9", http.StatusForbidden},
 	}
 	for _, c := range cases {
 		req := httptest.NewRequest("GET", "/", nil)
 		req.RemoteAddr = c.remote
-		if c.forwarded != "" {
-			req.Header.Set("X-Forwarded-For", c.forwarded)
+		for _, line := range strings.Split(c.forwarded, "|") {
+			if line != "" {
+				req.Header.Add("X-Forwarded-For", line)
+			}
 		}
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req)
