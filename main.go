@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/saracen/lfscache/server"
@@ -31,6 +32,12 @@ func main() {
 		lfsServerURL = flag.String("url", "", "LFS server URL")
 		directory    = flag.String("directory", "./objects", "cache directory")
 		printVersion = flag.Bool("v", false, "print version")
+
+		readOnly          = flag.Bool("read-only", false, "allow downloads only and authenticate to the upstream with a server credential")
+		upstreamTokenFile = flag.String("upstream-token-file", "", "path to an upstream token file which is reread for each batch request (required with -read-only)")
+		upstreamUser      = flag.String("upstream-basic-username", "x-access-token", "upstream HTTP Basic username used with -read-only")
+		allowedCIDRs      = flag.String("allowed-client-cidrs", "", "comma-separated client CIDRs allowed to use the cache")
+		trustedProxyCIDRs = flag.String("trusted-proxy-cidrs", "", "comma-separated proxy CIDRs trusted to set X-Forwarded-For")
 	)
 
 	flag.Parse()
@@ -56,9 +63,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	s, err := server.New(logger, addr.String(), *directory)
+	var s *server.Server
+	if *readOnly {
+		if *upstreamTokenFile == "" {
+			level.Error(logger).Log("err", "-read-only requires -upstream-token-file")
+			os.Exit(1)
+		}
+		s, err = server.NewReadOnly(logger, addr.String(), *directory, *upstreamUser, server.TokenFromFile(*upstreamTokenFile))
+	} else {
+		s, err = server.New(logger, addr.String(), *directory)
+	}
 	if err != nil {
 		panic(err)
+	}
+
+	handler := s.Handle()
+	if *allowedCIDRs != "" {
+		handler, err = server.NewCIDRAllowlist(handler, strings.Split(*allowedCIDRs, ","), strings.Split(*trustedProxyCIDRs, ","))
+		if err != nil {
+			level.Error(logger).Log("err", err)
+			os.Exit(1)
+		}
 	}
 
 	switch {
@@ -91,7 +116,7 @@ func main() {
 				})
 				panic(http.ListenAndServe(*httpAddr, nil))
 			} else {
-				panic(http.ListenAndServe(*httpAddr, s.Handle()))
+				panic(http.ListenAndServe(*httpAddr, handler))
 			}
 		}()
 	}
@@ -102,7 +127,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			panic(http.ListenAndServeTLS(*httpsAddr, *tlsCert, *tlsKey, s.Handle()))
+			panic(http.ListenAndServeTLS(*httpsAddr, *tlsCert, *tlsKey, handler))
 		}()
 	}
 
