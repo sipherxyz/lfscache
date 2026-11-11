@@ -4,6 +4,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -58,4 +59,40 @@ func TestConcurrentReadWriter(t *testing.T) {
 		crw.Write([]byte{byte(i)})
 	}
 	crw.Close()
+}
+
+// TestConcurrentReadWriterCloseWakesReader races a reader that reaches the
+// end of the data against the writer's Close. A Close between the reader's EOF
+// and its wait must still wake the reader; otherwise the reader never closes
+// and Close (and so FilesystemCache.Done) blocks forever.
+func TestConcurrentReadWriterCloseWakesReader(t *testing.T) {
+	for i := 0; i < 5000; i++ {
+		f, err := ioutil.TempFile("", "")
+		require.NoError(t, err)
+
+		crw := NewConcurrentReadWriter(f)
+		r := crw.Reader()
+
+		go func() {
+			ioutil.ReadAll(r)
+			r.Close()
+		}()
+
+		_, err = crw.Write([]byte("x"))
+		require.NoError(t, err)
+		if i%2 == 0 {
+			runtime.Gosched()
+		}
+
+		closed := make(chan error, 1)
+		go func() { closed <- crw.Close() }()
+
+		select {
+		case err := <-closed:
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: Close blocked, reader was not woken", i)
+		}
+		os.Remove(f.Name())
+	}
 }

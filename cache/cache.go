@@ -100,7 +100,9 @@ func (fc *FilesystemCache) Get(key string) (ReadAtReadCloser, io.WriteCloser, So
 		return singleflight.crw.Reader(), nil, SourceInflight, nil
 	}
 
-	f, err = os.Create(filepath.Join(fc.directory, DirTemp, key))
+	// a unique temp name: a previous fetch of the same key may still be
+	// closing (see Done) and must keep its own backing file
+	f, err = os.CreateTemp(filepath.Join(fc.directory, DirTemp), filepath.Base(key)+".*")
 	if err != nil {
 		return nil, nil, SourceFresh, err
 	}
@@ -121,16 +123,19 @@ func (fc *FilesystemCache) Get(key string) (ReadAtReadCloser, io.WriteCloser, So
 // moved to the cache directory.
 func (fc *FilesystemCache) Done(key string, err error) error {
 	fc.lock.Lock()
-	defer fc.lock.Unlock()
-
 	singleflight, ok := fc.singleflight[key]
+	if ok {
+		delete(fc.singleflight, key)
+	}
+	fc.lock.Unlock()
 
 	if !ok {
 		return ErrKeyNotFound
 	}
-	delete(fc.singleflight, key)
 
-	// ensure crw is closed
+	// ensure crw is closed. This blocks until every reader has closed, so it
+	// must not run under fc.lock: one slow or stuck client would otherwise
+	// block Get for every other key that is not on disk yet.
 	if err := singleflight.crw.Close(); err != nil {
 		return err
 	}

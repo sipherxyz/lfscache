@@ -37,6 +37,7 @@ func main() {
 		upstreamTokenFile = flag.String("upstream-token-file", "", "path to an upstream token file which is reread for each batch request (required with -read-only)")
 		upstreamUser      = flag.String("upstream-basic-username", "x-access-token", "upstream HTTP Basic username used with -read-only")
 		allowedCIDRs      = flag.String("allowed-client-cidrs", "", "comma-separated client CIDRs allowed to use the cache")
+		fetchIdleTimeout  = flag.Duration("fetch-idle-timeout", server.DefaultFetchIdleTimeout, "abort an upstream object download that receives no data for this long (0 disables)")
 		trustedProxyCIDRs = flag.String("trusted-proxy-cidrs", "", "comma-separated proxy CIDRs trusted to set X-Forwarded-For")
 	)
 
@@ -76,6 +77,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	s.FetchIdleTimeout = *fetchIdleTimeout
 
 	handler := s.Handle()
 	if *allowedCIDRs != "" {

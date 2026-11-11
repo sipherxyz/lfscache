@@ -116,6 +116,9 @@ func DefaultObjectBatchActionURLRewriter(href *url.URL) *url.URL {
 	return href
 }
 
+// DefaultFetchIdleTimeout is the default Server.FetchIdleTimeout.
+const DefaultFetchIdleTimeout = 60 * time.Second
+
 // Server is a LFS caching server.
 type Server struct {
 	logger   log.Logger
@@ -124,6 +127,11 @@ type Server struct {
 	cache    *cache.FilesystemCache
 	client   *http.Client
 	hmacKey  [64]byte
+
+	// FetchIdleTimeout aborts an upstream object download when no data
+	// arrives for this long, so a stalled connection cannot keep an object
+	// in flight forever. Zero disables it.
+	FetchIdleTimeout time.Duration
 
 	readOnly      bool
 	upstreamUser  string
@@ -193,6 +201,7 @@ func newServer(logger log.Logger, upstream, directory string, cacheEnabled bool)
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
+		FetchIdleTimeout:             DefaultFetchIdleTimeout,
 		ObjectBatchActionURLRewriter: DefaultObjectBatchActionURLRewriter,
 	}
 
@@ -578,7 +587,10 @@ func (s *Server) fetch(w io.Writer, oid, url string, size int, header http.Heade
 		}
 	}()
 
-	req, err := http.NewRequest("GET", url, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
@@ -588,15 +600,24 @@ func (s *Server) fetch(w io.Writer, oid, url string, size int, header http.Heade
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("upstream server responded with %d status", resp.StatusCode)
 	}
 
-	defer resp.Body.Close()
+	var body io.Reader = resp.Body
+	if s.FetchIdleTimeout > 0 {
+		idle := newIdleTimeoutReader(resp.Body, s.FetchIdleTimeout, cancel)
+		defer idle.stop()
+		body = idle
+	}
 
 	beginTransfer = time.Now()
-	_, err = io.Copy(hcw, resp.Body)
+	_, err = io.Copy(hcw, body)
+	if err != nil && ctx.Err() != nil {
+		err = fmt.Errorf("upstream download idle for %s: %w", s.FetchIdleTimeout, err)
+	}
 	if err == nil {
 		if oid != hex.EncodeToString(hcw.h.Sum(nil)) {
 			return fmt.Errorf("file checksum mismatch")
@@ -604,6 +625,30 @@ func (s *Server) fetch(w io.Writer, oid, url string, size int, header http.Heade
 	}
 
 	return err
+}
+
+// idleTimeoutReader calls cancel when a Read has not returned data for
+// timeout. Cancelling the request context makes the blocked Read return.
+type idleTimeoutReader struct {
+	r       io.Reader
+	timeout time.Duration
+	timer   *time.Timer
+}
+
+func newIdleTimeoutReader(r io.Reader, timeout time.Duration, cancel func()) *idleTimeoutReader {
+	return &idleTimeoutReader{r: r, timeout: timeout, timer: time.AfterFunc(timeout, cancel)}
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.timer.Reset(r.timeout)
+	}
+	return n, err
+}
+
+func (r *idleTimeoutReader) stop() {
+	r.timer.Stop()
 }
 
 type nc struct {
