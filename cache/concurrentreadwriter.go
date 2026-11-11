@@ -28,6 +28,10 @@ type ConcurrentReadWriter struct {
 	wake   *sync.Cond
 	wg     sync.WaitGroup
 	closed bool
+	// gen is incremented under lock on every Write and on Close, so that a
+	// reader can wait for a change it has not yet observed without losing a
+	// wakeup that happens between its read and its wait.
+	gen uint64
 }
 
 // NewConcurrentReadWriter returns a new ConcurrentReadWriter.
@@ -42,6 +46,7 @@ func NewConcurrentReadWriter(r ReadAtWriteCloser) *ConcurrentReadWriter {
 func (crw *ConcurrentReadWriter) Close() error {
 	crw.lock.Lock()
 	crw.closed = true
+	crw.gen++
 	crw.lock.Unlock()
 
 	// wake readers
@@ -64,16 +69,32 @@ func (crw *ConcurrentReadWriter) Closed() bool {
 // Write implements the standard Write interface.
 func (crw *ConcurrentReadWriter) Write(p []byte) (n int, err error) {
 	n, err = crw.r.Write(p)
+
+	crw.lock.Lock()
+	crw.gen++
+	crw.lock.Unlock()
 	crw.wake.Broadcast()
 
 	return
 }
 
-func (crw *ConcurrentReadWriter) wait() {
+// generation returns the current write generation and whether the
+// ConcurrentReadWriter has been closed.
+func (crw *ConcurrentReadWriter) generation() (uint64, bool) {
 	crw.lock.Lock()
 	defer crw.lock.Unlock()
 
-	crw.wake.Wait()
+	return crw.gen, crw.closed
+}
+
+// wait blocks until a Write or Close happens after generation seen.
+func (crw *ConcurrentReadWriter) wait(seen uint64) {
+	crw.lock.Lock()
+	defer crw.lock.Unlock()
+
+	for crw.gen == seen && !crw.closed {
+		crw.wake.Wait()
+	}
 }
 
 // Reader returns an io.Reader that can be used to read data as it is being
@@ -122,6 +143,10 @@ func (r *reader) ReadAt(p []byte, off int64) (n int, err error) {
 			return 0, io.EOF
 		}
 
+		// record the generation before reading, so that data written or a
+		// Close after this point is never missed by the wait below
+		seen, closed := r.crw.generation()
+
 		read, err = r.crw.r.ReadAt(p, off+int64(n))
 		n += read
 		s := len(p)
@@ -133,11 +158,9 @@ func (r *reader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 
 		// on EOF wait to for additional data if read/writer hasn't been closed
-		if err == io.EOF {
-			if !r.crw.Closed() {
-				r.crw.wait()
-				continue
-			}
+		if err == io.EOF && !closed {
+			r.crw.wait(seen)
+			continue
 		}
 		return
 	}
