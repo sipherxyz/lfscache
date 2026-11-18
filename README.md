@@ -10,6 +10,12 @@ lfs-cache is a caching proxy for [Git LFS](https://git-lfs.github.com/) servers.
 $ docker run --name lfscache --rm -d -v /my/cache/dir/lfs:/lfs saracen/lfscache:latest --url github.com/org/repo.git/info/lfs --http-addr :80  --directory /lfs
 ```
 
+The image runs as the non-root user `65532:65532`. A host directory mounted at
+`/lfs` must be writable by that user (`sudo chown -R 65532:65532 /my/cache/dir/lfs`),
+and a token file passed with `-upstream-token-file` must be readable by it.
+Docker 20.10+ lets non-root containers bind ports below 1024; on older engines
+use the default `:8080` and publish it (`-p 80:8080`).
+
 #### Binary
 
 Download the correct [binary](https://github.com/saracen/lfscache/releases) for your system.
