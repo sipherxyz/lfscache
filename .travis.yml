@@ -6,7 +6,7 @@ services:
   - docker
 
 go:
-  - 1.14
+  - 1.27.x
 
 go_import_path: github.com/saracen/lfscache
 
